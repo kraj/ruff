@@ -51,6 +51,7 @@ impl Docstring {
 pub struct DocstringFragment(String);
 
 impl DocstringFragment {
+    /// Creates a fragment from text extracted from a docstring.
     pub fn new(raw: &str) -> Self {
         Self(documentation_fragment_trim(raw))
     }
