@@ -201,6 +201,74 @@ fn merge_disjoint_exclusions<'db>(
     Some(common.build())
 }
 
+/// Remove exclusions already covered by another union element: `A | (B & ~A) = A | B`.
+///
+/// The coverage predicate must account for every materialization of a gradual exclusion.
+fn remove_covered_exclusions<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    mut is_covered: impl FnMut(Type<'db>) -> bool,
+) -> Option<Type<'db>> {
+    let Type::Intersection(intersection) = ty else {
+        return None;
+    };
+    let retained: SmallVec<[_; 2]> = intersection
+        .negative(db)
+        .iter()
+        .copied()
+        .filter(|excluded| !is_covered(*excluded))
+        .collect();
+    if retained.len() == intersection.negative(db).len() {
+        return None;
+    }
+
+    let mut widened = IntersectionBuilder::new(db, env)
+        .positive_elements(intersection.positive(db).iter().copied());
+    for negative in retained {
+        widened.add_negative_in_place(negative);
+    }
+    Some(widened.build())
+}
+
+/// Literal groups bypass pairwise union simplification. Match their exclusions in one pass so
+/// that restoring many excluded literals does not require comparing every pair of literals.
+fn normalize_covered_literal_exclusions<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    types: &mut [Type<'db>],
+    unpack_aliases: bool,
+) -> bool {
+    if !types.iter().any(|ty| {
+        matches!(ty, Type::Intersection(intersection) if !intersection.negative(db).is_empty())
+    }) {
+        return false;
+    }
+    let literals: FxHashSet<_> = types
+        .iter()
+        .filter_map(|ty| ty.as_literal_value_kind())
+        .collect();
+    if literals.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for ty in types {
+        if !unpack_aliases && any_over_type(db, env, *ty, false, Type::is_alias_like) {
+            continue;
+        }
+        if let Some(widened) = remove_covered_exclusions(db, env, *ty, |excluded| {
+            excluded
+                .as_literal_value_kind()
+                .is_some_and(|literal| literals.contains(&literal))
+        }) {
+            *ty = widened;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Return `true` if union simplification should preserve this pair because one element is
 /// `Hashable` and the other is a non-final nominal instance.
 ///
@@ -1157,6 +1225,34 @@ impl<'db> UnionBuilder<'db> {
                     self.add_in_place_impl(merged, seen_aliases);
                     return;
                 }
+                let remove_covered_by = |intersection, covering| {
+                    remove_covered_exclusions(db, &self.env, intersection, |excluded| {
+                        // Strict subtyping covers every materialization of a gradual exclusion;
+                        // assignability would not suffice.
+                        !should_preserve_hashable_union(db, &self.env, excluded, covering)
+                            && simplify_intersection_pair(
+                                db,
+                                &self.env,
+                                excluded,
+                                covering,
+                                IntersectionPolarity::Mixed,
+                            ) == IntersectionSimplification::Disjoint
+                    })
+                };
+                let without_covered_exclusions = remove_covered_by(ty, element_type)
+                    .map(|widened| (element_type, widened))
+                    .or_else(|| remove_covered_by(element_type, ty).map(|widened| (widened, ty)));
+                if let Some((existing, incoming)) = without_covered_exclusions {
+                    to_remove.push(i);
+                    for index in to_remove.into_iter().rev() {
+                        self.elements.swap_remove(index);
+                    }
+                    // Keep the covering element, and recheck the widened intersection against
+                    // earlier elements that it might now subsume.
+                    self.add_in_place_impl(existing, seen_aliases);
+                    self.add_in_place_impl(incoming, seen_aliases);
+                    return;
+                }
                 if ty.is_redundant_with(db, &self.env, element_type) {
                     return;
                 }
@@ -1257,7 +1353,10 @@ impl<'db> UnionBuilder<'db> {
             }
         }
 
-        if normalize_enum_complement_unions(db, &self.env, &mut types) {
+        if (!cycle_recovery
+            && normalize_covered_literal_exclusions(db, &self.env, &mut types, unpack_aliases))
+            || normalize_enum_complement_unions(db, &self.env, &mut types)
+        {
             let builder = UnionBuilder::new(db, &self.env)
                 .unpack_aliases(unpack_aliases)
                 .cycle_recovery(cycle_recovery)
